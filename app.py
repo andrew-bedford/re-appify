@@ -68,6 +68,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.executable = os.path.expanduser(config.get('App', 'executable'))
         self.endpoint = os.path.expanduser(config.get('App', 'endpoint'))
         self.application = config.get('App', 'application', fallback=None)
+
+        # The version this copy of the application expects its server to be. When it is set and a
+        # server of another version is running, that server is stopped and replaced rather than
+        # attached to - otherwise an update would show you the previous version's interface.
+        self.expected_version = config.get('App', 'version', fallback=None)
         self.startup_timeout = config.getfloat('App', 'startup_timeout', fallback=30.0)
 
     def startServer(self):
@@ -80,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.endpoint,
             self.executable,
             application=self.application,
+            version=self.expected_version,
             timeout=self.startup_timeout,
         )
 

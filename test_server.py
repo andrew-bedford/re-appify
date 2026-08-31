@@ -9,6 +9,7 @@ than what a machine happened to be doing at the time.
 
 import json
 import os
+import signal
 import tempfile
 import unittest
 from unittest import mock
@@ -177,6 +178,79 @@ class Stopping(LifecycleTest):
             running.stop()          # must not raise; there is nothing of ours to stop
 
         self.assertIsNone(running.process)
+
+
+class ReplacingAnOlderOne(LifecycleTest):
+    """A server left running by a previous version has to go before ours can have the port."""
+
+    def a_replacing_server(self, answer, **kwargs):
+        self.signalled = []
+        self.write_record(process_id=os.getpid())          # a process that is really alive
+        kwargs.setdefault("application", "re/log")
+        kwargs.setdefault("version", "2.0.0")
+        kwargs.setdefault("signaller", lambda pid, sig: self.signalled.append((pid, sig)))
+        kwargs.setdefault("stop_timeout", 0)               # do not linger over a fake process
+        return self.a_server(**kwargs), answer
+
+    def test_recognises_a_server_of_an_older_version(self):
+        running, answer = self.a_replacing_server({"application": "re/log", "version": "1.0.0"})
+        with mock.patch.object(server, "status", answering(answer)):
+            self.assertIsNotNone(running.outdated())
+
+    def test_does_not_call_a_matching_server_outdated(self):
+        running, answer = self.a_replacing_server({"application": "re/log", "version": "2.0.0"})
+        with mock.patch.object(server, "status", answering(answer)):
+            self.assertIsNone(running.outdated())
+
+    def test_will_not_touch_a_different_application_on_that_port(self):
+        # Somebody else's program is not ours to stop, whatever it is holding.
+        running, answer = self.a_replacing_server({"application": "something else", "version": "1.0.0"})
+        with mock.patch.object(server, "status", answering(answer)):
+            self.assertIsNone(running.outdated())
+
+    def test_will_not_touch_anything_when_no_version_is_expected(self):
+        running, answer = self.a_replacing_server({"application": "re/log", "version": "1.0.0"}, version=None)
+        with mock.patch.object(server, "status", answering(answer)):
+            self.assertIsNone(running.outdated())
+
+    def test_ignores_a_record_whose_process_is_gone(self):
+        running, answer = self.a_replacing_server({"application": "re/log", "version": "1.0.0"})
+        self.write_record(process_id=2147483647)           # a process that cannot exist
+        with mock.patch.object(server, "status", answering(answer)):
+            self.assertIsNone(running.outdated())
+
+    def test_stops_the_older_server_then_starts_its_own(self):
+        started = []
+
+        def launch(command):
+            started.append(command)
+            return FakeProcess()
+
+        running, answer = self.a_replacing_server(
+            {"application": "re/log", "version": "1.0.0"}, launcher=launch)
+
+        # The old server answers as version 1; ours is version 2, so it is replaced and then, once
+        # the record is ours, attached to.
+        replies = [answer, answer, {"application": "re/log", "version": "2.0.0"}]
+        with mock.patch.object(server, "status", lambda url, timeout=1.0: replies.pop(0) if len(replies) > 1 else replies[0]):
+            running.ensure_running()
+
+        self.assertEqual([(os.getpid(), signal.SIGTERM)], [s for s in self.signalled if s[1] == signal.SIGTERM])
+        self.assertEqual(1, len(started), "ours should have been started after the old one stopped")
+
+    def test_does_not_stop_anything_when_nothing_is_running(self):
+        self.signalled = []          # setUp leaves no record, which is the case being tested
+
+        def launch(command):
+            self.write_record(version="2.0.0")
+            return FakeProcess()
+
+        running = self.a_server(application="re/log", version="2.0.0", launcher=launch,
+                                signaller=lambda pid, sig: self.signalled.append((pid, sig)))
+        with mock.patch.object(server, "status", answering({"application": "re/log", "version": "2.0.0"})):
+            running.ensure_running()
+
+        self.assertEqual([], self.signalled)
 
 
 if __name__ == "__main__":

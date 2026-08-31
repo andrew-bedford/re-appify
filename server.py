@@ -7,6 +7,7 @@ copy of something already running - and none of it needs a screen to exercise.
 
 import json
 import os
+import signal
 import subprocess
 import time
 
@@ -48,6 +49,26 @@ class Endpoint:
         return Endpoint(url, record.get("version"), record.get("processId"))
 
 
+def alive(process_id):
+    """Whether a process is still there.
+
+    Signal zero asks the question without sending anything. Not being allowed to signal it is still
+    an answer: it exists.
+    """
+    if not process_id:
+        return False
+
+    try:
+        os.kill(process_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError):
+        return False
+
+
 def status(url, timeout=1.0):
     """What the thing answering at `url` says it is, or None if it is not answering or not ours.
 
@@ -74,14 +95,15 @@ class Server:
     """The application's server: found if it is already running, started if it is not."""
 
     def __init__(self, endpoint_path, executable, application=None, version=None,
-                 timeout=30.0, poll=0.1, launcher=subprocess.Popen, clock=time.monotonic,
-                 sleep=time.sleep):
+                 timeout=30.0, poll=0.1, stop_timeout=10.0, launcher=subprocess.Popen,
+                 clock=time.monotonic, sleep=time.sleep, signaller=os.kill):
         self.endpoint_path = endpoint_path
         self.executable = executable
         self.application = application
         self.version = version
         self.timeout = timeout
         self.poll = poll
+        self.stop_timeout = stop_timeout
         self.url = None
         self.process = None
 
@@ -90,6 +112,7 @@ class Server:
         self._launch = launcher
         self._now = clock
         self._sleep = sleep
+        self._signal = signaller
 
     def running(self):
         """The URL of a server already running and fit to use, or None.
@@ -113,6 +136,48 @@ class Server:
             return None
 
         return endpoint.url
+
+    def outdated(self):
+        """A running server that is ours but the wrong version, or None.
+
+        Deliberately narrow. Not answering could be anything; answering as a different application
+        means the port belongs to somebody else's program, and stopping that would be inexcusable.
+        Only a live server that says it is this application, at a version this window does not
+        match, has both a reason to be replaced and the standing to be.
+        """
+        if self.version is None:
+            return None
+
+        endpoint = Endpoint.read(self.endpoint_path)
+        if endpoint is None or not alive(endpoint.process_id):
+            return None
+
+        answer = status(endpoint.url)
+        if answer is None:
+            return None
+
+        if self.application is not None and answer.get("application") != self.application:
+            return None
+
+        return None if answer.get("version") == self.version else endpoint
+
+    def replace(self, endpoint):
+        """Stops a server so that ours can have the port."""
+        try:
+            self._signal(endpoint.process_id, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+        deadline = self._now() + self.stop_timeout
+        while self._now() < deadline:
+            if not alive(endpoint.process_id):
+                return
+            self._sleep(self.poll)
+
+        try:
+            self._signal(endpoint.process_id, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
     def start(self):
         """Starts the server and waits for it to answer.
@@ -141,10 +206,19 @@ class Server:
         raise ServerError("the application did not start within %g seconds" % self.timeout)
 
     def ensure_running(self):
-        """The URL to load: whatever is already there if it will do, otherwise a server we start."""
+        """The URL to load: whatever is already there if it will do, otherwise a server we start.
+
+        A server left running by an older version is stopped first rather than reused. Attaching to
+        it would show the previous version's interface after an update, with nothing on screen to
+        say why, and it is holding the port ours needs anyway.
+        """
         self.url = self.running()
         if self.url is not None:
             return self.url
+
+        stale = self.outdated()
+        if stale is not None:
+            self.replace(stale)
 
         return self.start()
 
