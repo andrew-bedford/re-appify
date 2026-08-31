@@ -253,5 +253,53 @@ class ReplacingAnOlderOne(LifecycleTest):
         self.assertEqual([], self.signalled)
 
 
+class ReadingTheSettings(LifecycleTest):
+    """How the window should behave, as the application writes it down."""
+
+    def write_settings(self, contents):
+        path = os.path.join(self.directory, "desktop.json")
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(contents)
+        return path
+
+    def test_reads_what_the_application_wrote(self):
+        path = self.write_settings(json.dumps({"runInBackground": False, "showTrayIcon": False}))
+        found = server.settings(path)
+        self.assertFalse(found["runInBackground"])
+        self.assertFalse(found["showTrayIcon"])
+
+    def test_keeps_the_two_apart(self):
+        path = self.write_settings(json.dumps({"runInBackground": False, "showTrayIcon": True}))
+        found = server.settings(path)
+        self.assertFalse(found["runInBackground"])
+        self.assertTrue(found["showTrayIcon"])
+
+    def test_keeps_running_and_shows_the_tray_when_nothing_was_written(self):
+        found = server.settings(os.path.join(self.directory, "desktop.json"))
+        self.assertTrue(found["runInBackground"])
+        self.assertTrue(found["showTrayIcon"])
+
+    def test_falls_back_when_no_path_is_configured(self):
+        self.assertEqual(server.DEFAULT_SETTINGS, server.settings(None))
+
+    def test_falls_back_when_the_file_cannot_be_read(self):
+        path = self.write_settings("{ this is not json")
+        self.assertEqual(server.DEFAULT_SETTINGS, server.settings(path))
+
+    def test_falls_back_when_it_is_not_an_object(self):
+        path = self.write_settings('"just a string"')
+        self.assertEqual(server.DEFAULT_SETTINGS, server.settings(path))
+
+    def test_fills_in_whatever_is_missing(self):
+        path = self.write_settings(json.dumps({"runInBackground": False}))
+        found = server.settings(path)
+        self.assertFalse(found["runInBackground"])
+        self.assertTrue(found["showTrayIcon"], "a setting nobody wrote keeps its default")
+
+    def test_ignores_anything_it_does_not_know_about(self):
+        path = self.write_settings(json.dumps({"runInBackground": False, "somethingElse": 42}))
+        self.assertEqual({"runInBackground": False, "showTrayIcon": True}, server.settings(path))
+
+
 if __name__ == "__main__":
     unittest.main()

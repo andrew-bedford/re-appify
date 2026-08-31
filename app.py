@@ -1,12 +1,15 @@
 #!/usr/bin/python3
 import os
+import signal
 import sys
 import configparser
 
+import server as lifecycle
 from server import Server, ServerError
 
 from PyQt6 import QtWidgets, QtWebEngineWidgets, QtWebEngineCore, QtCore
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QSplashScreen, QLabel, QSizePolicy, QStyle
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QSplashScreen, QLabel, QSizePolicy,
+                             QStyle, QSystemTrayIcon, QMenu)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile
 from PyQt6.QtCore import Qt, QUrl, QTimer
@@ -73,7 +76,53 @@ class MainWindow(QtWidgets.QMainWindow):
         # server of another version is running, that server is stopped and replaced rather than
         # attached to - otherwise an update would show you the previous version's interface.
         self.expected_version = config.get('App', 'version', fallback=None)
+
+        # Settings the application itself writes, about how its window should behave. Read fresh
+        # each time they are needed rather than kept, so that changing one takes effect at once
+        # instead of at the next launch.
+        settings = config.get('App', 'settings', fallback=None)
+        self.settings_path = os.path.expanduser(settings) if settings else None
         self.startup_timeout = config.getfloat('App', 'startup_timeout', fallback=30.0)
+
+    def desktopSettings(self):
+        return lifecycle.settings(self.settings_path)
+
+    def showTrayIcon(self):
+        """Somewhere to see that the application is still running, and to stop it.
+
+        Only worth having when something is going to be left running: with the server stopping along
+        with the window there is nothing for it to represent.
+        """
+        settings = self.desktopSettings()
+        if not (settings["runInBackground"] and settings["showTrayIcon"]):
+            return
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray = QSystemTrayIcon(QIcon(self.icon), self)
+        self.tray.setToolTip(self.title)
+
+        menu = QMenu()
+        menu.addAction("Open", self.showNormal)
+        menu.addSeparator()
+        menu.addAction("Quit", self.quitCompletely)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self.showNormal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.show()
+
+    def quitCompletely(self):
+        """Stops the server as well as the window, whatever the background setting says.
+
+        Quit from the tray is the one place someone has asked for exactly that, so it is the one
+        place that ignores the setting.
+        """
+        if self.server is not None:
+            self.server.stop()
+        if self.tray is not None:
+            self.tray.hide()
+        QApplication.quit()
 
     def startServer(self):
         """Finds a server already running, or starts one, and loads it.
@@ -94,6 +143,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except ServerError as failure:
             self.showFailure(str(failure))
             return
+
+        self.showTrayIcon()
 
         self.browser.setUrl(QUrl(self.url))
         self.browser.loadFinished.connect(self.delayedShowBrowser)
@@ -180,6 +231,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.browser.page().setBackgroundColor(QtCore.Qt.GlobalColor.transparent)
         self.browser.page().quotaRequested.connect(lambda request: request.accept())
 
+        self.tray = None
+        self.server = None
+
         self.showSplashscreen()
 
         # After the splashscreen is up, so that there is something to look at while the server
@@ -212,6 +266,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.previousWindowState = self.windowState()
 
     def closeEvent(self, event):
+        # Read now rather than at startup, so that turning the setting off and closing the window
+        # does what it says in the same session.
+        if self.server is not None and not self.desktopSettings()["runInBackground"]:
+            self.server.stop()
+
         if self.close_confirmation:
             reply = QtWidgets.QMessageBox.question(self, 'Confirm Exit', self.close_confirmation,
                                                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
@@ -233,4 +292,17 @@ if __name__ == '__main__':
     take_screenshot() # Take initial screenshot before showing the main window
     window = MainWindow()
     window.showMaximized()
+
+    # Being asked to stop - at logout, or by anything that sends a term signal - goes through the
+    # same closing as the window being closed, so that whatever the application asked to happen when
+    # its window closes happens here too rather than being skipped.
+    signal.signal(signal.SIGTERM, lambda number, frame: window.close())
+
+    # Qt's event loop does not run Python code while it waits, so a signal that arrives during the
+    # wait is not delivered until something else happens. Waking briefly and regularly gives Python
+    # the chance.
+    signals = QTimer()
+    signals.start(200)
+    signals.timeout.connect(lambda: None)
+
     app.exec()

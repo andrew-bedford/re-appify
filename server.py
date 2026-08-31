@@ -49,6 +49,33 @@ class Endpoint:
         return Endpoint(url, record.get("version"), record.get("processId"))
 
 
+#: How the window behaves when the application has not said otherwise: keep the server running once
+#: the window closes, and show a tray icon so that it is visible while it does.
+DEFAULT_SETTINGS = {"runInBackground": True, "showTrayIcon": True}
+
+
+def settings(path):
+    """How the application says its window should behave.
+
+    Every way of not knowing gives the same answer as never having been asked. A window that would
+    not open because a settings file was truncated would be a worse failure than any of these
+    settings being wrong.
+    """
+    if not path:
+        return dict(DEFAULT_SETTINGS)
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            found = json.load(file)
+    except (OSError, ValueError):
+        return dict(DEFAULT_SETTINGS)
+
+    if not isinstance(found, dict):
+        return dict(DEFAULT_SETTINGS)
+
+    return {key: found.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
+
+
 def alive(process_id):
     """Whether a process is still there.
 
