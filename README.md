@@ -3,7 +3,7 @@ A simple python script that creates a desktop window using Qt, automatically sta
 
 ![](https://github.com/andrew-bedford/pyqt-hackrylic/raw/main/Screenshots/QWebEngine.jpg)
 
-**Note**: Work in progress. It's more of a proof of concept at the moment.
+**Note**: Work in progress.
 
 ## Development
 ### Running
@@ -16,8 +16,21 @@ python app.py
 To configure your re/app, edit the `config.ini` file that is located in the `_internal`. It allows you to specify:
  - `icon`: Path to the image that is to be used as the taskbar's icon and as the splashscreen.
  - `title`: The window title to display. At the moment, this window title is static, so it cannot be changed at runtime once the application starts.
- - `path`: The path to your project on which `dotnet run` will be executed. We may want to update this later to support more than just .NET applications.
- - `url`: The url of your web application (e.g., https://localhost:12345). Once the server has started, it will load and display the screen. While the local server is starting, the splashscreen will be displayed.
+ - `executable`: The application to run. This is a built application, not a source tree - re/app is meant to start something that is installed, which has no SDK and no sources to build from.
+ - `endpoint`: The file your application writes the address it is listening on into. re/app reads this rather than assuming a port, so your application can take a free one and two copies never collide.
+ - `application`: Optional. The name your application answers with at `/api/status`. When set, re/app refuses to attach to anything that gives a different answer, so whatever else happens to be listening is never mistaken for yours.
+ - `startup_timeout`: Optional, 30 seconds by default. How long to wait for your application to answer before giving up and saying so.
+
+### What your application has to do
+re/app no longer polls a fixed url, because something answering on a port is not evidence of being your application. Instead your application should:
+ - Write a small JSON file at the `endpoint` path once it is listening, holding `url`, `version` and `processId`. Write it to one side and move it into place, so a reader never sees half of it, and remove it when you shut down cleanly.
+ - Answer `GET /api/status` with `{"application": "...", "version": "..."}`.
+
+### Running the tests
+The lifecycle - finding a server, reusing it, starting one, giving up on one that never answers - is in `server.py`, apart from the window, and is tested without Qt or a display:
+```
+python3 -m unittest test_server
+```
 
 ### Publishing
 To generate an installer for your application, you can use PyInstaller:

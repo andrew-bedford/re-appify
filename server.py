@@ -1,0 +1,160 @@
+"""Finding, starting and stopping the application's server.
+
+Kept apart from the window on purpose. This is the part that can be wrong in ways nobody notices -
+attaching to the wrong server, waiting forever for one that will never answer, starting a second
+copy of something already running - and none of it needs a screen to exercise.
+"""
+
+import json
+import os
+import subprocess
+import time
+
+import requests
+
+
+class ServerError(Exception):
+    """The server could not be started, or never became ready."""
+
+
+class Endpoint:
+    """Where a server said it was listening, as it wrote it down."""
+
+    def __init__(self, url, version, process_id):
+        self.url = url
+        self.version = version
+        self.process_id = process_id
+
+    @staticmethod
+    def read(path):
+        """The record at `path`, or None for every way of not having one.
+
+        Missing, unreadable, half written and incomplete all mean the same thing to a caller - there
+        is nothing to attach to - so they are not distinguished here.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                record = json.load(file)
+        except (OSError, ValueError):
+            return None
+
+        if not isinstance(record, dict):
+            return None
+
+        url = record.get("url")
+        if not url:
+            return None
+
+        return Endpoint(url, record.get("version"), record.get("processId"))
+
+
+def status(url, timeout=1.0):
+    """What the thing answering at `url` says it is, or None if it is not answering or not ours.
+
+    Answering on a port is not evidence of being the application: anything at all could be there,
+    including a stale copy of something else. This asks.
+    """
+    try:
+        response = requests.get(url.rstrip("/") + "/api/status", timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        answer = response.json()
+    except ValueError:
+        return None
+
+    return answer if isinstance(answer, dict) and answer.get("application") else None
+
+
+class Server:
+    """The application's server: found if it is already running, started if it is not."""
+
+    def __init__(self, endpoint_path, executable, application=None, version=None,
+                 timeout=30.0, poll=0.1, launcher=subprocess.Popen, clock=time.monotonic,
+                 sleep=time.sleep):
+        self.endpoint_path = endpoint_path
+        self.executable = executable
+        self.application = application
+        self.version = version
+        self.timeout = timeout
+        self.poll = poll
+        self.url = None
+        self.process = None
+
+        # Injected so the waiting can be tested without actually waiting, and starting without
+        # actually starting anything.
+        self._launch = launcher
+        self._now = clock
+        self._sleep = sleep
+
+    def running(self):
+        """The URL of a server already running and fit to use, or None.
+
+        Fit to use means it answers, says it is the application we want, and is the version we
+        expect. A server from an older version is not reused: attaching to it would show the
+        previous version's interface with nothing on screen to explain why.
+        """
+        endpoint = Endpoint.read(self.endpoint_path)
+        if endpoint is None:
+            return None
+
+        answer = status(endpoint.url)
+        if answer is None:
+            return None
+
+        if self.application is not None and answer.get("application") != self.application:
+            return None
+
+        if self.version is not None and answer.get("version") != self.version:
+            return None
+
+        return endpoint.url
+
+    def start(self):
+        """Starts the server and waits for it to answer.
+
+        Raises rather than returning a failure, because there is nothing sensible for the caller to
+        do with a server that is not there, and the alternative - a splashscreen that never goes
+        away - is what this replaces.
+        """
+        if not self.executable or not os.path.exists(self.executable):
+            raise ServerError("re/app cannot find the application to start: %s" % self.executable)
+
+        self.process = self._launch([self.executable])
+
+        deadline = self._now() + self.timeout
+        while self._now() < deadline:
+            endpoint = Endpoint.read(self.endpoint_path)
+            if endpoint is not None and status(endpoint.url) is not None:
+                self.url = endpoint.url
+                return self.url
+
+            if self.process.poll() is not None:
+                raise ServerError("the application stopped while starting up")
+
+            self._sleep(self.poll)
+
+        raise ServerError("the application did not start within %g seconds" % self.timeout)
+
+    def ensure_running(self):
+        """The URL to load: whatever is already there if it will do, otherwise a server we start."""
+        self.url = self.running()
+        if self.url is not None:
+            return self.url
+
+        return self.start()
+
+    def stop(self):
+        """Stops the server, if this is the one that started it."""
+        if self.process is None or self.process.poll() is not None:
+            return
+
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()

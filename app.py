@@ -1,10 +1,9 @@
 #!/usr/bin/python3
 import os
 import sys
-import time
-import requests
-import subprocess
 import configparser
+
+from server import Server, ServerError
 
 from PyQt6 import QtWidgets, QtWebEngineWidgets, QtWebEngineCore, QtCore
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QSplashScreen, QLabel, QSizePolicy, QStyle
@@ -13,30 +12,34 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngine
 from PyQt6.QtCore import Qt, QUrl, QTimer
 from PyQt6.QtGui import QDesktopServices, QPixmap, QIcon, QGuiApplication
 
-def isReachable(url):
-    try:
-        request = requests.get(url)
-        if request.status_code == 200:
-            return True
-        else:
-            return False
+# Where re/app itself lives. Everything it ships with is found relative to this rather than to
+# wherever it happened to be launched from, because an installed application is started from
+# anywhere and cannot assume it can even write to the current directory.
+HERE = os.path.dirname(os.path.realpath(__file__))
 
-    except requests.exceptions.RequestException as e:
-        return False
+def cache_directory():
+    """Somewhere writable for things re/app makes rather than ships."""
+    root = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    directory = os.path.join(root, "re", "app")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+def screenshot_path():
+    return os.path.join(cache_directory(), "screenshot.png")
 
 def take_screenshot():
     screen_geometry = QGuiApplication.primaryScreen().geometry()
     # TODO: Check if this will work with multiple screens, probably not.
     screenshot = QGuiApplication.primaryScreen().grabWindow(0, screen_geometry.left(), screen_geometry.top(), screen_geometry.width(), screen_geometry.height())
-    screenshot.save("screenshot.png")
+    screenshot.save(screenshot_path())
+
+# Named after the application rather than shared, so that two applications built on re/app do not
+# end up reading each other's local storage, cookies and cache.
+PROFILE_NAME = "re-app"
 
 class OpenLinksInDesktopBrowserWebEnginePage(QWebEnginePage):
     def __init__(self, webengine_view):
-        # Enable persistent local storage
-        # TODO: Use a slug of the application's name instead of "persistent" to avoid conflicts
-        #       with other applications. To get the location where the data is being saved:
-        #       `self.browser.page().profile().persistentStoragePath()`
-        persistent_profile = QWebEngineProfile("persistent", webengine_view)
+        persistent_profile = QWebEngineProfile(PROFILE_NAME, webengine_view)
         super().__init__(persistent_profile, webengine_view)
 
     def acceptNavigationRequest(self, url, navType, isMainFrame):
@@ -49,18 +52,47 @@ class OpenLinksInDesktopBrowserWebEnginePage(QWebEnginePage):
 class MainWindow(QtWidgets.QMainWindow):
     def loadConfig(self):
         config = configparser.ConfigParser()
-        config.read('_internal/config.ini')
+        config.read(os.path.join(HERE, '_internal', 'config.ini'))
         self.iconPath = config.get('App', 'icon')
-        self.path = config.get('App', 'path')
         self.title = config.get('App', 'title')
-        self.url = config.get('App', 'url')
         self.close_confirmation = config.get('App', 'close_confirmation', fallback=None)
 
-    def loadServer(self):
-        if (isReachable(self.url)):
-            self.timer.stop()
-            self.browser.setUrl(QUrl(self.url))
-            self.browser.loadFinished.connect(self.delayedShowBrowser)
+        # What to run, and where it writes down the address it is listening on. Between them these
+        # replace the old pairing of a source directory to run `dotnet run` in and a fixed url to
+        # poll: an installed application has neither a source tree nor a port it can count on.
+        self.executable = os.path.expanduser(config.get('App', 'executable'))
+        self.endpoint = os.path.expanduser(config.get('App', 'endpoint'))
+        self.application = config.get('App', 'application', fallback=None)
+        self.startup_timeout = config.getfloat('App', 'startup_timeout', fallback=30.0)
+
+    def startServer(self):
+        """Finds a server already running, or starts one, and loads it.
+
+        Failure ends here rather than in a splashscreen nobody can get past: if the application
+        cannot be started there is nothing to wait for, and saying so is the only useful thing left.
+        """
+        self.server = Server(
+            self.endpoint,
+            self.executable,
+            application=self.application,
+            timeout=self.startup_timeout,
+        )
+
+        try:
+            self.url = self.server.ensure_running()
+        except ServerError as failure:
+            self.showFailure(str(failure))
+            return
+
+        self.browser.setUrl(QUrl(self.url))
+        self.browser.loadFinished.connect(self.delayedShowBrowser)
+
+    def showFailure(self, message):
+        self.splash.setPixmap(QPixmap())
+        self.splash.setText(message)
+        self.splash.setWordWrap(True)
+        self.splash.setStyleSheet("color: white; font-size: 16px; padding: 48px;")
+        self.splash.show()
 
     # We introduce a small delay to give the pages a bit more time to render
     # after loading.
@@ -98,7 +130,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.background_widget = QWidget(self.main_widget)
         self.background_widget.setGeometry(0, 0, self.width(), self.height())
         self.background = QLabel(self.background_widget)
-        self.screenshot = QPixmap("screenshot.png")
+        self.screenshot = QPixmap(screenshot_path())
         self.background.setPixmap(self.screenshot)
         self.background.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -137,12 +169,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.showSplashscreen()
 
-        if (not isReachable(self.url)):
-            subprocess.Popen(["dotnet", "run", "--project", self.path])
-
-        self.timer=QTimer()
-        self.timer.timeout.connect(self.loadServer)
-        self.timer.start(100)
+        # After the splashscreen is up, so that there is something to look at while the server
+        # starts, and after a single pass of the event loop so that it is actually painted.
+        QTimer.singleShot(50, self.startServer)
 
     def resizeEvent(self, event):
         # Quick attempt to get the titlebar's height so that we can correctly offset the image. We do not actually
@@ -161,7 +190,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_background(self):
         take_screenshot()
-        self.screenshot = QPixmap("screenshot.png")
+        self.screenshot = QPixmap(screenshot_path())
         self.background.setPixmap(self.screenshot)
 
     def changeEvent(self, event):
@@ -188,9 +217,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 if __name__ == '__main__':
     # QtWebEngine dictionaries are required for spell checking.
-    workingDirectory = os.path.dirname(os.path.realpath(__file__))
     os.environ["QTWEBENGINE_DICTIONARIES_PATH"] = os.path.join(
-        workingDirectory, "_internal", "qtwebengine_dictionaries"
+        HERE, "_internal", "qtwebengine_dictionaries"
     )
 
     app = QtWidgets.QApplication(sys.argv)

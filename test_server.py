@@ -1,0 +1,183 @@
+"""Tests for the lifecycle, with no Qt, no display and no real server.
+
+Written against the standard library so that they run wherever Python does, and so that testing
+re/app never becomes a reason to install anything.
+
+Everything the application would talk to is stood in for, so these say what the logic does rather
+than what a machine happened to be doing at the time.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+import server
+from server import Endpoint, Server, ServerError
+
+
+class FakeProcess:
+    """A started process whose fate the test decides."""
+
+    def __init__(self, exits_with=None):
+        self._exits_with = exits_with
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self._exits_with
+
+    def terminate(self):
+        self.terminated = True
+        self._exits_with = 0
+
+    def wait(self, timeout=None):
+        return self._exits_with
+
+    def kill(self):
+        self.killed = True
+
+
+def answering(reply):
+    """Stands in for asking a server what it is."""
+    return lambda url, timeout=1.0: reply
+
+
+class LifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.directory = self._directory.name
+        self.record_path = os.path.join(self.directory, "server.json")
+        self.executable = os.path.join(self.directory, "app")
+        with open(self.executable, "w", encoding="utf-8"):
+            pass
+
+    def tearDown(self):
+        self._directory.cleanup()
+
+    def write_record(self, url="http://127.0.0.1:41234", version="1.0.0", process_id=1234):
+        with open(self.record_path, "w", encoding="utf-8") as file:
+            json.dump({"url": url, "version": version, "processId": process_id}, file)
+
+    def a_server(self, executable=None, **kwargs):
+        kwargs.setdefault("launcher", lambda command: FakeProcess())
+        kwargs.setdefault("sleep", lambda seconds: None)
+        return Server(self.record_path, executable or self.executable, **kwargs)
+
+
+class ReadingTheRecord(LifecycleTest):
+    def test_reads_a_record(self):
+        self.write_record()
+        endpoint = Endpoint.read(self.record_path)
+        self.assertEqual("http://127.0.0.1:41234", endpoint.url)
+        self.assertEqual("1.0.0", endpoint.version)
+
+    def test_no_record_at_all(self):
+        self.assertIsNone(Endpoint.read(self.record_path))
+
+    def test_unreadable_record(self):
+        with open(self.record_path, "w", encoding="utf-8") as file:
+            file.write("{ this is not json")
+        self.assertIsNone(Endpoint.read(self.record_path))
+
+    def test_record_with_no_address(self):
+        with open(self.record_path, "w", encoding="utf-8") as file:
+            json.dump({"version": "1.0.0", "processId": 1234}, file)
+        self.assertIsNone(Endpoint.read(self.record_path))
+
+    def test_record_that_is_not_an_object(self):
+        with open(self.record_path, "w", encoding="utf-8") as file:
+            file.write('"just a string"')
+        self.assertIsNone(Endpoint.read(self.record_path))
+
+
+class ReusingWhatIsAlreadyRunning(LifecycleTest):
+    def test_reuses_a_server_that_is_already_running(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering({"application": "re/log", "version": "1.0.0"})):
+            running = self.a_server(application="re/log", version="1.0.0")
+            self.assertEqual("http://127.0.0.1:41234", running.ensure_running())
+            self.assertIsNone(running.process, "nothing should have been started")
+
+    def test_ignores_a_record_when_nothing_answers(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering(None)):
+            self.assertIsNone(self.a_server(application="re/log").running())
+
+    def test_ignores_something_else_answering_on_that_port(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering({"application": "something else"})):
+            self.assertIsNone(self.a_server(application="re/log").running())
+
+    def test_does_not_reuse_a_server_of_another_version(self):
+        self.write_record(version="0.9.0")
+        with mock.patch.object(server, "status", answering({"application": "re/log", "version": "0.9.0"})):
+            self.assertIsNone(self.a_server(application="re/log", version="1.0.0").running())
+
+    def test_reuses_regardless_of_version_when_none_is_expected(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering({"application": "re/log", "version": "0.9.0"})):
+            self.assertEqual("http://127.0.0.1:41234", self.a_server(application="re/log").running())
+
+
+class StartingOne(LifecycleTest):
+    def test_starts_a_server_when_none_is_running(self):
+        started = []
+
+        def launch(command):
+            started.append(command)
+            self.write_record()          # the server publishes where it is listening
+            return FakeProcess()
+
+        with mock.patch.object(server, "status", answering({"application": "re/log", "version": "1.0.0"})):
+            running = self.a_server(launcher=launch, application="re/log", version="1.0.0")
+            self.assertEqual("http://127.0.0.1:41234", running.ensure_running())
+            self.assertEqual(1, len(started))
+
+    def test_gives_up_when_the_server_never_answers(self):
+        ticks = iter(range(0, 100))
+        with mock.patch.object(server, "status", answering(None)):
+            running = self.a_server(timeout=5, clock=lambda: next(ticks), application="re/log")
+            with self.assertRaisesRegex(ServerError, "did not start"):
+                running.start()
+
+    def test_gives_up_when_the_server_exits_while_starting(self):
+        with mock.patch.object(server, "status", answering(None)):
+            running = self.a_server(launcher=lambda command: FakeProcess(exits_with=1), application="re/log")
+            with self.assertRaisesRegex(ServerError, "stopped while starting"):
+                running.start()
+
+    def test_says_so_when_the_application_is_not_where_it_should_be(self):
+        running = self.a_server(executable=os.path.join(self.directory, "not-here"))
+        with self.assertRaisesRegex(ServerError, "cannot find"):
+            running.start()
+
+
+class Stopping(LifecycleTest):
+    def test_stops_a_server_it_started(self):
+        process = FakeProcess()
+
+        def launch(command):
+            self.write_record()
+            return process
+
+        with mock.patch.object(server, "status", answering({"application": "re/log"})):
+            running = self.a_server(launcher=launch, application="re/log")
+            running.ensure_running()
+            running.stop()
+
+        self.assertTrue(process.terminated)
+
+    def test_does_not_stop_a_server_it_only_attached_to(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering({"application": "re/log"})):
+            running = self.a_server(application="re/log")
+            running.ensure_running()
+            running.stop()          # must not raise; there is nothing of ours to stop
+
+        self.assertIsNone(running.process)
+
+
+if __name__ == "__main__":
+    unittest.main()
