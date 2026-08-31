@@ -50,8 +50,10 @@ class Endpoint:
 
 
 #: How the window behaves when the application has not said otherwise: keep the server running once
-#: the window closes, and show a tray icon so that it is visible while it does.
-DEFAULT_SETTINGS = {"runInBackground": True, "showTrayIcon": True}
+#: the window closes, show a tray icon so that it is visible while it does, and leave the title bar
+#: alone. The title bar stays by default because a window without one cannot be dragged on desktops
+#: that expect it to be, and only the person using it knows whether theirs is such a desktop.
+DEFAULT_SETTINGS = {"runInBackground": True, "showTrayIcon": True, "hideTitleBar": False}
 
 
 def settings(path):

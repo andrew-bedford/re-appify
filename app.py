@@ -185,6 +185,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         # self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint) # For a frameless window
 
+        self.tray = None
+        self.server = None
+
         self.main_widget = QWidget(self)
         self.setGeometry(0, 0, 1280, 720)
         self.setCentralWidget(self.main_widget)
@@ -210,6 +213,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed) # Prevents the window from resizing when changing the central widget
         self.loadConfig()
+
+        # Some desktops hide title bars - a tiling one has no use for them - and there is no way to
+        # ask which, so the application says. Applied here because a window's frame is decided when
+        # it is built, which is why changing this takes effect the next time re/log is opened.
+        if self.desktopSettings()["hideTitleBar"]:
+            self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint)
+
         if self.desktop_file:
             QApplication.setDesktopFileName(self.desktop_file)
         self.setWindowTitle(self.title)
@@ -230,9 +240,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.browser.setPage(OpenLinksInDesktopBrowserWebEnginePage(self.browser))
         self.browser.page().setBackgroundColor(QtCore.Qt.GlobalColor.transparent)
         self.browser.page().quotaRequested.connect(lambda request: request.accept())
-
-        self.tray = None
-        self.server = None
 
         self.showSplashscreen()
 

@@ -297,8 +297,20 @@ class ReadingTheSettings(LifecycleTest):
         self.assertTrue(found["showTrayIcon"], "a setting nobody wrote keeps its default")
 
     def test_ignores_anything_it_does_not_know_about(self):
-        path = self.write_settings(json.dumps({"runInBackground": False, "somethingElse": 42}))
-        self.assertEqual({"runInBackground": False, "showTrayIcon": True}, server.settings(path))
+        # Asserted this way rather than against the whole set of defaults, so that adding a setting
+        # does not break a test about something else.
+        found = self.write_settings(json.dumps({"runInBackground": False, "somethingElse": 42}))
+        settings = server.settings(found)
+
+        self.assertNotIn("somethingElse", settings)
+        self.assertFalse(settings["runInBackground"])
+
+    def test_leaves_the_title_bar_alone_unless_asked(self):
+        self.assertFalse(server.settings(None)["hideTitleBar"])
+
+    def test_hides_the_title_bar_when_asked(self):
+        path = self.write_settings(json.dumps({"hideTitleBar": True}))
+        self.assertTrue(server.settings(path)["hideTitleBar"])
 
 
 if __name__ == "__main__":
