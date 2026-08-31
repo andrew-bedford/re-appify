@@ -57,6 +57,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.title = config.get('App', 'title')
         self.close_confirmation = config.get('App', 'close_confirmation', fallback=None)
 
+        # The name of the .desktop file this application is installed with, without the extension.
+        # Telling Qt lets the desktop associate the window with its entry, so it is named and iconed
+        # in a window switcher rather than showing up as a stray python process.
+        self.desktop_file = config.get('App', 'desktop_file', fallback=None)
+
         # What to run, and where it writes down the address it is listening on. Between them these
         # replace the old pairing of a source directory to run `dotnet run` in and a fixed url to
         # poll: an installed application has neither a source tree nor a port it can count on.
@@ -148,6 +153,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed) # Prevents the window from resizing when changing the central widget
         self.loadConfig()
+        if self.desktop_file:
+            QApplication.setDesktopFileName(self.desktop_file)
         self.setWindowTitle(self.title)
         self.resize(self.screen().geometry().width(), self.screen().geometry().height()) # Use screen dimensions as default window size
         self.icon = QPixmap(self.iconPath)
