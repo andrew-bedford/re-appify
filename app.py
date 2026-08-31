@@ -174,17 +174,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QTimer.singleShot(50, self.startServer)
 
     def resizeEvent(self, event):
-        # Quick attempt to get the titlebar's height so that we can correctly offset the image. We do not actually
-        # use it at the moment because my window manager hides title bars.
-        titlebar_height = app.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight)
-
         self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
         self.color_layer.setGeometry(self.rect())
         self.browser.setGeometry(self.rect())
         super().resizeEvent(event)
 
     def moveEvent(self, event):
-        titlebar_height = app.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight)
         self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
         super().moveEvent(event)
 
