@@ -168,6 +168,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splash.hide()
         self.browser.show()
 
+    def showMaximized(self):
+        """Asks to be maximised, and expects to have to ask again.
+
+        QtWebEngine gives the window a native surface of its own only once the window is already up,
+        and the desktop takes that new surface for a window that never asked to be maximised: a
+        state change back to normal follows a moment later and the window settles at whatever size
+        a floating one is given - two thirds of the screen, here. So the request is remembered
+        rather than assumed to have been granted.
+        """
+        self.awaitingMaximized = True
+        super().showMaximized()
+
     def showSplashscreen(self):
         self.splash = QLabel(self.main_widget)
         self.splash.setGeometry(self.rect())
@@ -187,6 +199,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tray = None
         self.server = None
+
+        # Both are needed before the things they describe exist, because a resize and a state change
+        # can arrive while the window is still being built.
+        self.splash = None
+        self.awaitingMaximized = False
 
         self.main_widget = QWidget(self)
         self.setGeometry(0, 0, 1280, 720)
@@ -251,6 +268,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
         self.color_layer.setGeometry(self.rect())
         self.browser.setGeometry(self.rect())
+        # The splashscreen has to follow the window like everything else on it. It used to be sized
+        # once, before the desktop had said how big the window would actually be, so the logo was
+        # centred on a rectangle the size of the whole screen and came out low and to the right of
+        # the middle - or off the window altogether when the window ended up smaller still.
+        if self.splash is not None:
+            self.splash.setGeometry(self.rect())
         super().resizeEvent(event)
 
     def moveEvent(self, event):
@@ -264,13 +287,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def changeEvent(self, event):
         if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            # Losing the maximised state before anyone has touched the window is the web engine's
+            # doing rather than a choice, so ask again. Only ever once: the next window that stops
+            # being maximised is someone un-maximising it, and that has to be allowed to work.
+            if self.awaitingMaximized and not self.isMaximized():
+                self.awaitingMaximized = False
+                super().showMaximized()
+
             # HACK: Update background when un-minimizing
             if ((self.previousWindowState & QtCore.Qt.WindowState.WindowMinimized) and
                 (not self.windowState() or (self.windowState() & QtCore.Qt.WindowState.WindowMaximized))):
                 self.update_background()
-                super().changeEvent(event)
 
             self.previousWindowState = self.windowState()
+
+        super().changeEvent(event)
 
     def closeEvent(self, event):
         # Read now rather than at startup, so that turning the setting off and closing the window
