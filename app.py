@@ -31,10 +31,41 @@ def screenshot_path():
     return os.path.join(cache_directory(), "screenshot.png")
 
 def take_screenshot():
-    screen_geometry = QGuiApplication.primaryScreen().geometry()
-    # TODO: Check if this will work with multiple screens, probably not.
-    screenshot = QGuiApplication.primaryScreen().grabWindow(0, screen_geometry.left(), screen_geometry.top(), screen_geometry.width(), screen_geometry.height())
-    screenshot.save(screenshot_path())
+    """Photographs the desktop for the window to sit blurred in front of.
+
+    Says whether it got one. Wayland does not let a window help itself to the screen, and the grab
+    comes back empty rather than refusing, so a launch that cannot have a picture has to throw the
+    previous one away: saving nothing over it would leave the last capture that worked on disk, and
+    the window would open in front of a picture of some earlier day's desktop for good.
+    """
+    screen = QGuiApplication.primaryScreen()
+    screenshot = QPixmap()
+    if screen is not None:
+        screen_geometry = screen.geometry()
+        # TODO: Check if this will work with multiple screens, probably not.
+        screenshot = screen.grabWindow(0, screen_geometry.left(), screen_geometry.top(), screen_geometry.width(), screen_geometry.height())
+
+    if screenshot.isNull():
+        try:
+            os.remove(screenshot_path())
+        except OSError:
+            pass
+        return False
+
+    return screenshot.save(screenshot_path())
+
+def desktop_screenshot(screen):
+    """The last photograph of the desktop, at the size it is meant to be drawn.
+
+    A pixmap does not carry its device pixel ratio through a PNG, so on a scaled screen it comes
+    back saying it is twice the size it should be drawn at and only its middle would show. What the
+    ratio was is worked out again from the screen rather than remembered.
+    """
+    screenshot = QPixmap(screenshot_path())
+    width = screen.geometry().width() if screen is not None else 0
+    if not screenshot.isNull() and width > 0:
+        screenshot.setDevicePixelRatio(max(1.0, screenshot.width() / width))
+    return screenshot
 
 # Named after the application rather than shared, so that two applications built on re/app do not
 # end up reading each other's local storage, cookies and cache.
@@ -210,11 +241,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.main_widget)
 
         self.background_widget = QWidget(self.main_widget)
-        self.background_widget.setGeometry(0, 0, self.width(), self.height())
         self.background = QLabel(self.background_widget)
-        self.screenshot = QPixmap(screenshot_path())
+        self.screenshot = desktop_screenshot(self.screen())
         self.background.setPixmap(self.screenshot)
         self.background.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layOutBackground()
 
         # Add a blur effect to the screenshot used as background for the window
         blur = QtWidgets.QGraphicsBlurEffect()
@@ -264,8 +295,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # starts, and after a single pass of the event loop so that it is actually painted.
         QTimer.singleShot(50, self.startServer)
 
-    def resizeEvent(self, event):
+    def layOutBackground(self):
+        """Lines the blurred desktop up with the desktop it is a picture of.
+
+        The widget is offset by where the window is, so that its own origin sits on the screen's and
+        what shows through the window is the part of the desktop the window is standing on. The
+        picture inside it is then the size of the screen, said explicitly: a QLabel left to work it
+        out takes the size of its pixmap instead, so a capture smaller than the screen - or the one
+        left behind by a desktop that cannot be captured at all - was drawn as a rectangle ending
+        partway across the window, with a visible edge where it stopped.
+        """
         self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
+        screen_geometry = self.screen().geometry()
+        self.background.setGeometry(0, 0, screen_geometry.width(), screen_geometry.height())
+
+    def resizeEvent(self, event):
+        self.layOutBackground()
         self.color_layer.setGeometry(self.rect())
         self.browser.setGeometry(self.rect())
         # The splashscreen has to follow the window like everything else on it. It used to be sized
@@ -277,12 +322,12 @@ class MainWindow(QtWidgets.QMainWindow):
         super().resizeEvent(event)
 
     def moveEvent(self, event):
-        self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
+        self.layOutBackground()
         super().moveEvent(event)
 
     def update_background(self):
         take_screenshot()
-        self.screenshot = QPixmap(screenshot_path())
+        self.screenshot = desktop_screenshot(self.screen())
         self.background.setPixmap(self.screenshot)
 
     def changeEvent(self, event):
