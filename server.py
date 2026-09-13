@@ -208,8 +208,8 @@ class Server:
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
-    def start(self):
-        """Starts the server and waits for it to answer.
+    def launch(self):
+        """Starts the server without waiting for it: `ready` says when it answers.
 
         Raises rather than returning a failure, because there is nothing sensible for the caller to
         do with a server that is not there, and the alternative - a splashscreen that never goes
@@ -219,23 +219,42 @@ class Server:
             raise ServerError("re/app cannot find the application to start: %s" % self.executable)
 
         self.process = self._launch([self.executable])
+        self._deadline = self._now() + self.timeout
 
-        deadline = self._now() + self.timeout
-        while self._now() < deadline:
-            endpoint = Endpoint.read(self.endpoint_path)
-            if endpoint is not None and status(endpoint.url) is not None:
-                self.url = endpoint.url
-                return self.url
+    def ready(self):
+        """The URL once the launched server answers, or None while it is still starting.
 
-            if self.process.poll() is not None:
-                raise ServerError("the application stopped while starting up")
+        Asks once and returns, so that a window can ask between frames. Waiting in a loop of sleeps
+        froze the window for as long as the server took, splashscreen included.
+        """
+        endpoint = Endpoint.read(self.endpoint_path)
+        if endpoint is not None and status(endpoint.url) is not None:
+            self.url = endpoint.url
+            return self.url
 
+        if self.process.poll() is not None:
+            raise ServerError("the application stopped while starting up")
+
+        if self._now() >= self._deadline:
+            raise ServerError("the application did not start within %g seconds" % self.timeout)
+
+        return None
+
+    def start(self):
+        """Starts the server and waits for it to answer."""
+        self.launch()
+        while True:
+            url = self.ready()
+            if url is not None:
+                return url
             self._sleep(self.poll)
 
-        raise ServerError("the application did not start within %g seconds" % self.timeout)
+    def begin(self):
+        """The URL now if a server fit to use is already running, otherwise None with ours launched.
 
-    def ensure_running(self):
-        """The URL to load: whatever is already there if it will do, otherwise a server we start.
+        What the window calls before it has even built itself, so that the server's startup and the
+        window's happen at the same time rather than one after the other; `ready` is then asked
+        until the URL comes back.
 
         A server left running by an older version is stopped first rather than reused. Attaching to
         it would show the previous version's interface after an update, with nothing on screen to
@@ -249,7 +268,16 @@ class Server:
         if stale is not None:
             self.replace(stale)
 
-        return self.start()
+        self.launch()
+        return None
+
+    def ensure_running(self):
+        """The URL to load: whatever is already there if it will do, otherwise a server we start."""
+        url = self.begin()
+        while url is None:
+            self._sleep(self.poll)
+            url = self.ready()
+        return url
 
     def stop(self):
         """Stops the server, if this is the one that started it."""

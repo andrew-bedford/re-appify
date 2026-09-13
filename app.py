@@ -3,6 +3,7 @@ import os
 import signal
 import sys
 import configparser
+from types import SimpleNamespace
 
 import backdrop
 import server as lifecycle
@@ -116,37 +117,74 @@ class OpenLinksInDesktopBrowserWebEnginePage(QWebEnginePage):
             return False
         return super().acceptNavigationRequest(url, navType, isMainFrame)
 
-class MainWindow(QtWidgets.QMainWindow):
-    def loadConfig(self):
-        config = configparser.ConfigParser()
-        config.read(os.path.join(HERE, '_internal', 'config.ini'))
-        self.iconPath = config.get('App', 'icon')
-        self.title = config.get('App', 'title')
-        self.close_confirmation = config.get('App', 'close_confirmation', fallback=None)
+def load_config():
+    """What `_internal/config.ini` says.
+
+    Read before there is a window rather than by it, because the server is started before the window
+    is built and needs to know what to start.
+    """
+    config = configparser.ConfigParser()
+    config.read(os.path.join(HERE, '_internal', 'config.ini'))
+
+    # Settings the application itself writes, about how its window should behave. Read fresh each
+    # time they are needed rather than kept, so that changing one takes effect at once instead of at
+    # the next launch.
+    settings = config.get('App', 'settings', fallback=None)
+
+    return SimpleNamespace(
+        iconPath=config.get('App', 'icon'),
+        title=config.get('App', 'title'),
+        close_confirmation=config.get('App', 'close_confirmation', fallback=None),
 
         # The name of the .desktop file this application is installed with, without the extension.
         # Telling Qt lets the desktop associate the window with its entry, so it is named and iconed
         # in a window switcher rather than showing up as a stray python process.
-        self.desktop_file = config.get('App', 'desktop_file', fallback=None)
+        desktop_file=config.get('App', 'desktop_file', fallback=None),
 
         # What to run, and where it writes down the address it is listening on. Between them these
         # replace the old pairing of a source directory to run `dotnet run` in and a fixed url to
         # poll: an installed application has neither a source tree nor a port it can count on.
-        self.executable = os.path.expanduser(config.get('App', 'executable'))
-        self.endpoint = os.path.expanduser(config.get('App', 'endpoint'))
-        self.application = config.get('App', 'application', fallback=None)
+        executable=os.path.expanduser(config.get('App', 'executable')),
+        endpoint=os.path.expanduser(config.get('App', 'endpoint')),
+        application=config.get('App', 'application', fallback=None),
 
         # The version this copy of the application expects its server to be. When it is set and a
         # server of another version is running, that server is stopped and replaced rather than
         # attached to - otherwise an update would show you the previous version's interface.
-        self.expected_version = config.get('App', 'version', fallback=None)
+        expected_version=config.get('App', 'version', fallback=None),
 
-        # Settings the application itself writes, about how its window should behave. Read fresh
-        # each time they are needed rather than kept, so that changing one takes effect at once
-        # instead of at the next launch.
-        settings = config.get('App', 'settings', fallback=None)
-        self.settings_path = os.path.expanduser(settings) if settings else None
-        self.startup_timeout = config.getfloat('App', 'startup_timeout', fallback=30.0)
+        settings_path=os.path.expanduser(settings) if settings else None,
+        startup_timeout=config.getfloat('App', 'startup_timeout', fallback=30.0),
+    )
+
+def begin_server(config):
+    """The server, already on its way, with its URL if it was running and why not if it cannot be.
+
+    Called before anything of the window exists. Starting the server was the window's last step, so
+    the server's second or so of startup came after all of the window's own instead of alongside it.
+    """
+    server = Server(
+        config.endpoint,
+        config.executable,
+        application=config.application,
+        version=config.expected_version,
+        timeout=config.startup_timeout,
+    )
+
+    try:
+        return server, server.begin(), None
+    except ServerError as failure:
+        return server, None, failure
+
+# How often the window asks whether the server has started. Asked between frames, so this costs the
+# splashscreen nothing, and it is the most a launch can lose to not having asked yet.
+SERVER_POLL_MILLISECONDS = 20
+
+class MainWindow(QtWidgets.QMainWindow):
+    def loadConfig(self, config):
+        # Kept as attributes of the window, which is where everything else in it looks for them.
+        for name, value in vars(config).items():
+            setattr(self, name, value)
 
     def desktopSettings(self):
         return lifecycle.settings(self.settings_path)
@@ -188,30 +226,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tray.hide()
         QApplication.quit()
 
-    def startServer(self):
-        """Finds a server already running, or starts one, and loads it.
+    def followServer(self, url, failure):
+        """Loads the server's page as soon as there is one, asking between frames until then.
 
         Failure ends here rather than in a splashscreen nobody can get past: if the application
         cannot be started there is nothing to wait for, and saying so is the only useful thing left.
         """
-        self.server = Server(
-            self.endpoint,
-            self.executable,
-            application=self.application,
-            version=self.expected_version,
-            timeout=self.startup_timeout,
-        )
+        if failure is not None:
+            self.showFailure(str(failure))
+        elif url is not None:
+            self.loadPage(url)
+        else:
+            self.serverPoll = QTimer(self)
+            self.serverPoll.timeout.connect(self.checkServer)
+            self.serverPoll.start(SERVER_POLL_MILLISECONDS)
 
+    def checkServer(self):
         try:
-            self.url = self.server.ensure_running()
+            url = self.server.ready()
         except ServerError as failure:
+            self.serverPoll.stop()
             self.showFailure(str(failure))
             return
 
+        if url is not None:
+            self.serverPoll.stop()
+            self.loadPage(url)
+
+    def loadPage(self, url):
+        self.url = url
         self.showTrayIcon()
 
+        self.browser.loadFinished.connect(self.showBrowser)
         self.browser.setUrl(QUrl(self.url))
-        self.browser.loadFinished.connect(self.delayedShowBrowser)
 
     def showFailure(self, message):
         self.splash.setPixmap(QPixmap())
@@ -220,15 +267,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splash.setStyleSheet("color: white; font-size: 16px; padding: 48px;")
         self.splash.show()
 
-    # We introduce a small delay to give the pages a bit more time to render
-    # after loading.
-    def delayedShowBrowser(self):
-        self.timer=QTimer()
-        self.timer.timeout.connect(self.showBrowser)
-        self.timer.start(100)
-
+    # Shown the moment the page has loaded. It used to wait another tenth of a second "to give the
+    # page time to render", but the page arrives rendered - the server prerenders it - and that
+    # tenth of a second was only ever spent looking at the splashscreen.
     def showBrowser(self):
-        self.timer.stop()
         self.splash.hide()
         self.browser.show()
 
@@ -257,12 +299,14 @@ class MainWindow(QtWidgets.QMainWindow):
         profile.setSpellCheckEnabled = True
         profile.setSpellCheckLanguages = ["en-US"]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, server, url, failure, *args, **kwargs):
+        """`server` is already on its way (see begin_server): `url` if it was already running,
+        `failure` if it cannot be started, and neither while it is still starting."""
         super(MainWindow, self).__init__(*args, **kwargs)
         # self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint) # For a frameless window
 
         self.tray = None
-        self.server = None
+        self.server = server
 
         # Both are needed before the things they describe exist, because a resize and a state change
         # can arrive while the window is still being built.
@@ -293,7 +337,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.previousWindowState = self.windowState()
 
         # self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed) # Prevents the window from resizing when changing the central widget
-        self.loadConfig()
+        self.loadConfig(config)
 
         # Some desktops hide title bars - a tiling one has no use for them - and there is no way to
         # ask which, so the application says. Applied here because a window's frame is decided when
@@ -324,9 +368,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.showSplashscreen()
 
-        # After the splashscreen is up, so that there is something to look at while the server
-        # starts, and after a single pass of the event loop so that it is actually painted.
-        QTimer.singleShot(50, self.startServer)
+        # No longer after a pause for the splashscreen to be painted: waiting on the server does not
+        # hold up the event loop any more, so the splashscreen paints while the page loads.
+        self.followServer(url, failure)
 
     def layOutBackground(self):
         """Lines the blurred desktop up with the desktop it is a picture of.
@@ -408,9 +452,13 @@ if __name__ == '__main__':
         HERE, "_internal", "qtwebengine_dictionaries"
     )
 
+    # First, before Qt: the server takes longer to start than the window does to build.
+    config = load_config()
+    server, url, failure = begin_server(config)
+
     app = QtWidgets.QApplication(sys.argv)
     take_screenshot() # Take initial screenshot before showing the main window
-    window = MainWindow()
+    window = MainWindow(config, server, url, failure)
     window.showMaximized()
 
     # Being asked to stop - at logout, or by anything that sends a term signal - goes through the

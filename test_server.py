@@ -149,6 +149,40 @@ class StartingOne(LifecycleTest):
             with self.assertRaisesRegex(ServerError, "stopped while starting"):
                 running.start()
 
+    def test_begin_hands_back_a_running_server_without_starting_one(self):
+        self.write_record()
+        with mock.patch.object(server, "status", answering({"application": "re/log"})):
+            running = self.a_server(application="re/log")
+            self.assertEqual("http://127.0.0.1:41234", running.begin())
+            self.assertIsNone(running.process)
+
+    def test_begin_launches_without_waiting_and_ready_says_when_it_answers(self):
+        replies = [None, {"application": "re/log"}]
+
+        def launch(command):
+            self.write_record()
+            return FakeProcess()
+
+        running = self.a_server(launcher=launch, application="re/log")
+        with mock.patch.object(server, "status", answering(None)):
+            self.assertIsNone(running.begin())
+        self.assertIsNotNone(running.process, "begin should have launched the server")
+
+        with mock.patch.object(server, "status", lambda url, timeout=1.0: replies.pop(0)):
+            self.assertIsNone(running.ready(), "not answering yet")
+            self.assertEqual("http://127.0.0.1:41234", running.ready())
+
+    def test_ready_gives_up_once_the_timeout_has_passed(self):
+        now = [0]
+        with mock.patch.object(server, "status", answering(None)):
+            running = self.a_server(timeout=5, clock=lambda: now[0], application="re/log")
+            running.launch()
+            now[0] = 4
+            self.assertIsNone(running.ready())
+            now[0] = 5
+            with self.assertRaisesRegex(ServerError, "did not start"):
+                running.ready()
+
     def test_says_so_when_the_application_is_not_where_it_should_be(self):
         running = self.a_server(executable=os.path.join(self.directory, "not-here"))
         with self.assertRaisesRegex(ServerError, "cannot find"):
