@@ -20,6 +20,8 @@ To configure your re/app, edit the `config.ini` file that is located in the `_in
  - `endpoint`: The file your application writes the address it is listening on into. re/app reads this rather than assuming a port, so your application can take a free one and two copies never collide.
  - `application`: Optional. The name your application answers with at `/api/status`. When set, re/app refuses to attach to anything that gives a different answer, so whatever else happens to be listening is never mistaken for yours.
  - `startup_timeout`: Optional, 30 seconds by default. How long to wait for your application to answer before giving up and saying so.
+ - `ready_attribute`: Optional. An attribute your page sets on its `<html>` element once it has drawn itself. The splashscreen stays up until it appears, so a page that builds itself from script after loading is not seen doing it. Without it the page is shown as soon as it has loaded.
+ - `ready_timeout`: Optional, 5 seconds by default. The longest to wait for `ready_attribute`, so a page that never sets it is shown late rather than not at all.
 
 ### What your application has to do
 re/app no longer polls a fixed url, because something answering on a port is not evidence of being your application. Instead your application should:

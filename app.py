@@ -3,6 +3,8 @@ import os
 import signal
 import sys
 import configparser
+import json
+import time
 from types import SimpleNamespace
 
 import backdrop
@@ -13,7 +15,7 @@ from PyQt6 import QtWidgets, QtWebEngineWidgets, QtWebEngineCore, QtCore
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QSplashScreen, QLabel, QSizePolicy,
                              QStyle, QSystemTrayIcon, QMenu)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile, QWebEngineScript
 from PyQt6.QtCore import Qt, QUrl, QTimer, QSize
 from PyQt6.QtGui import QDesktopServices, QPixmap, QIcon, QGuiApplication
 
@@ -155,6 +157,14 @@ def load_config():
 
         settings_path=os.path.expanduser(settings) if settings else None,
         startup_timeout=config.getfloat('App', 'startup_timeout', fallback=30.0),
+
+        # An attribute the page sets on its <html> element once it has drawn itself, and how long to
+        # wait for it. A page that has loaded is not a page that is finished: one that goes on to draw
+        # itself from script would otherwise be watched doing it. Without an attribute the page is
+        # shown as soon as it loads; with one it never waits longer than the timeout, so a page that
+        # does not set it is late rather than never shown.
+        ready_attribute=config.get('App', 'ready_attribute', fallback=None),
+        ready_timeout=config.getfloat('App', 'ready_timeout', fallback=5.0),
     )
 
 def begin_server(config):
@@ -179,6 +189,25 @@ def begin_server(config):
 # How often the window asks whether the server has started. Asked between frames, so this costs the
 # splashscreen nothing, and it is the most a launch can lose to not having asked yet.
 SERVER_POLL_MILLISECONDS = 20
+
+# Keeps a page out of sight until it says it is ready, from the moment its document exists. The view
+# itself cannot be hidden instead: QtWebEngine gives the window its native surface when the view first
+# appears, and a view shown only once the page was ready did that to a window already on screen, which
+# the desktop answered by resizing it and then never drawing the page at all. A stylesheet adopted by
+# the document hides the page from the page's side, and needs no element to exist yet to attach to.
+# Hidden with visibility rather than display, so the page is still laid out and can measure itself.
+HOLD_PAGE_SCRIPT = """(function () {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync('html { visibility: hidden !important; }');
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+    window.__reAppHold = sheet;
+})();"""
+
+RELEASE_PAGE_SCRIPT = """(function () {
+    if (!window.__reAppHold) { return; }
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter(sheet => sheet !== window.__reAppHold);
+    window.__reAppHold = null;
+})();"""
 
 class MainWindow(QtWidgets.QMainWindow):
     def loadConfig(self, config):
@@ -257,8 +286,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url = url
         self.showTrayIcon()
 
-        self.browser.loadFinished.connect(self.showBrowser)
+        self.browser.loadFinished.connect(self.pageLoaded)
         self.browser.setUrl(QUrl(self.url))
+
+    def pageLoaded(self, ok):
+        """Shows the page now, or once it says it is ready if the application has said it will."""
+        if self.pageShown or not self.ready_attribute:
+            self.showBrowser()
+            return
+
+        self.readyDeadline = time.monotonic() + self.ready_timeout
+        self.readyPoll = QTimer(self)
+        self.readyPoll.timeout.connect(self.askIfReady)
+        self.readyPoll.start(SERVER_POLL_MILLISECONDS)
+
+    def askIfReady(self):
+        if time.monotonic() >= self.readyDeadline:
+            self.showBrowser()
+            return
+
+        self.browser.page().runJavaScript(
+            "document.documentElement.hasAttribute(%s)" % json.dumps(self.ready_attribute),
+            lambda ready: self.showBrowser() if ready else None)
 
     def showFailure(self, message):
         self.splash.setPixmap(QPixmap())
@@ -267,12 +316,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splash.setStyleSheet("color: white; font-size: 16px; padding: 48px;")
         self.splash.show()
 
-    # Shown the moment the page has loaded. It used to wait another tenth of a second "to give the
-    # page time to render", but the page arrives rendered - the server prerenders it - and that
-    # tenth of a second was only ever spent looking at the splashscreen.
+    # Asked for by more than one answer to the same question - a reply that says ready, the timeout,
+    # a reload - so it has to be fine to arrive at twice. A reload creates a new document, which the
+    # hold script hides again, so the page is released every time rather than only the first.
+    #
+    # The splashscreen goes once the page has been released rather than as it is asked to be: the
+    # release runs in the page, a moment later, and taking the splashscreen down first left a frame
+    # of bare backdrop between the two.
     def showBrowser(self):
-        self.splash.hide()
-        self.browser.show()
+        if self.readyPoll is not None:
+            self.readyPoll.stop()
+        self.pageShown = True
+        self.browser.page().runJavaScript(RELEASE_PAGE_SCRIPT, lambda result: self.splash.hide())
 
     def showMaximized(self):
         """Asks to be maximised, and expects to have to ask again.
@@ -312,6 +367,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # can arrive while the window is still being built.
         self.splash = None
         self.awaitingMaximized = False
+        self.readyPoll = None
+        self.pageShown = False
 
         self.main_widget = QWidget(self)
         self.setGeometry(0, 0, 1280, 720)
@@ -365,6 +422,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.browser.setPage(OpenLinksInDesktopBrowserWebEnginePage(self.browser))
         self.browser.page().setBackgroundColor(QtCore.Qt.GlobalColor.transparent)
         self.browser.page().quotaRequested.connect(lambda request: request.accept())
+
+        # The splashscreen is a transparent label over the page, so a page left visible underneath was
+        # seen drawing itself around the logo. See HOLD_PAGE_SCRIPT for why it is the page that is
+        # hidden and not the view.
+        if self.ready_attribute:
+            hold = QWebEngineScript()
+            hold.setName("re-app-hold-page")
+            hold.setSourceCode(HOLD_PAGE_SCRIPT)
+            hold.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+            hold.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+            hold.setRunsOnSubFrames(False)
+            self.browser.page().scripts().insert(hold)
 
         self.showSplashscreen()
 
