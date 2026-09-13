@@ -4,6 +4,7 @@ import signal
 import sys
 import configparser
 
+import backdrop
 import server as lifecycle
 from server import Server, ServerError
 
@@ -12,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QSplashScreen, 
                              QStyle, QSystemTrayIcon, QMenu)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineProfile
-from PyQt6.QtCore import Qt, QUrl, QTimer
+from PyQt6.QtCore import Qt, QUrl, QTimer, QSize
 from PyQt6.QtGui import QDesktopServices, QPixmap, QIcon, QGuiApplication
 
 # Where re/app itself lives. Everything it ships with is found relative to this rather than to
@@ -36,11 +37,12 @@ def take_screenshot():
     Says whether it got one. Wayland does not let a window help itself to the screen, and the grab
     comes back empty rather than refusing, so a launch that cannot have a picture has to throw the
     previous one away: saving nothing over it would leave the last capture that worked on disk, and
-    the window would open in front of a picture of some earlier day's desktop for good.
+    the window would open in front of a picture of some earlier day's desktop for good. Where the
+    session is known not to allow it the grab is not even attempted (see backdrop.can_photograph).
     """
     screen = QGuiApplication.primaryScreen()
     screenshot = QPixmap()
-    if screen is not None:
+    if screen is not None and backdrop.can_photograph(QGuiApplication.platformName()):
         screen_geometry = screen.geometry()
         # TODO: Check if this will work with multiple screens, probably not.
         screenshot = screen.grabWindow(0, screen_geometry.left(), screen_geometry.top(), screen_geometry.width(), screen_geometry.height())
@@ -66,6 +68,37 @@ def desktop_screenshot(screen):
     if not screenshot.isNull() and width > 0:
         screenshot.setDevicePixelRatio(max(1.0, screenshot.width() / width))
     return screenshot
+
+def wallpaper_backdrop(screen):
+    """The desktop's wallpaper, filling the screen the way a wallpaper does.
+
+    Where there is no photograph of the desktop to stand in front of - on Wayland - its wallpaper is
+    the next best likeness. Unlike a capture it is not already the size of the screen, so it is scaled
+    to cover the screen and cut to it: drawn as it comes, a picture shaped differently from the screen
+    would leave bands along two sides, with the blur ending in a hard edge where they began.
+    """
+    if screen is None:
+        return QPixmap()
+
+    path = backdrop.find_wallpaper(output=screen.name())
+    picture = QPixmap(path) if path else QPixmap()
+    size = screen.geometry().size()
+    if picture.isNull() or size.isEmpty():
+        return QPixmap()
+
+    ratio = screen.devicePixelRatio()
+    target = QSize(round(size.width() * ratio), round(size.height() * ratio))
+    scaled = picture.scaled(target, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                            Qt.TransformationMode.SmoothTransformation)
+    fitted = scaled.copy((scaled.width() - target.width()) // 2, (scaled.height() - target.height()) // 2,
+                         target.width(), target.height())
+    fitted.setDevicePixelRatio(ratio)
+    return fitted
+
+def desktop_backdrop(screen):
+    """The photograph of the desktop when there is one, and its wallpaper when there is not."""
+    screenshot = desktop_screenshot(screen)
+    return screenshot if not screenshot.isNull() else wallpaper_backdrop(screen)
 
 # Named after the application rather than shared, so that two applications built on re/app do not
 # end up reading each other's local storage, cookies and cache.
@@ -242,7 +275,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.background_widget = QWidget(self.main_widget)
         self.background = QLabel(self.background_widget)
-        self.screenshot = desktop_screenshot(self.screen())
+        self.screenshot = desktop_backdrop(self.screen())
         self.background.setPixmap(self.screenshot)
         self.background.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.layOutBackground()
@@ -304,6 +337,10 @@ class MainWindow(QtWidgets.QMainWindow):
         out takes the size of its pixmap instead, so a capture smaller than the screen - or the one
         left behind by a desktop that cannot be captured at all - was drawn as a rectangle ending
         partway across the window, with a visible edge where it stopped.
+
+        Wayland never tells a window where it is, so there x and y are always 0. A maximised window
+        is where that is true anyway; any other one shows the top left of the wallpaper, and does not
+        pan across it as it is dragged.
         """
         self.background_widget.setGeometry(-self.x(), -self.y(), self.width()+self.x(), self.height()+self.y())
         screen_geometry = self.screen().geometry()
@@ -327,7 +364,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_background(self):
         take_screenshot()
-        self.screenshot = desktop_screenshot(self.screen())
+        self.screenshot = desktop_backdrop(self.screen())
         self.background.setPixmap(self.screenshot)
 
     def changeEvent(self, event):
